@@ -1956,6 +1956,8 @@ static IOR_offset_t WriteOrRead(IOR_param_t *test, IOR_results_t *results,
 
         totalErrorCount += CountErrors(test, access, errors);
 
+        if ((strcasecmp(test->api, "HDF5") == 0) && (access == WRITE || access == READ))
+                backend->sync(test->backend_options);            /*sync after all accesses */
         if (access == WRITE && test->fsync == TRUE) {
                 backend->fsync(fd, test->backend_options);       /*fsync after all accesses */
         }
