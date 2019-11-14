@@ -19,17 +19,20 @@
 #include <stdio.h>              /* only for fprintf() */
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 /* HDF5 routines here still use the old 1.6 style.  Nothing wrong with that but
  * save users the trouble of  passing this flag through configure */
-#define H5_USE_16_API
+//#define H5_USE_16_API
 #include <hdf5.h>
 #include <mpi.h>
+#include <daos.h>
 
 #include "aiori.h"              /* abstract IOR interface */
 #include "utilities.h"
 #include "iordef.h"
 
 #define NUM_DIMS 1              /* number of dimensions to data set */
+#define RANK_LIST "1:2:3:4:5:6:7:8:9:10:11:12:13:14:15:16" /* Rank list for excluding a server */
 
 /******************************************************************************/
 /*
@@ -99,10 +102,16 @@ static int HDF5_RmDir(const char *, IOR_param_t *);
 static int HDF5_Access(const char *, int, IOR_param_t *);
 static int HDF5_Stat(const char *, struct stat *, IOR_param_t *);
 
+static void KillServer();
+
 /************************** O P T I O N S *****************************/
 typedef struct{
   int collective_md;
   int chunk_size;
+  char *obj_class;
+  int which_server;
+  int which_server2;
+  int which_repetition;
 } HDF5_options_t;
 /***************************** F U N C T I O N S ******************************/
 
@@ -115,6 +124,10 @@ static option_help * HDF5_options(void ** init_backend_options, void * init_valu
     /* initialize the options properly */
     o->collective_md = 0;
     o->chunk_size = 0;
+    o->obj_class = strdup("S1");
+    o->which_server = -1;
+    o->which_server2 = -1;
+    o->which_repetition = 0;
   }
 
   *init_backend_options = o;
@@ -122,10 +135,15 @@ static option_help * HDF5_options(void ** init_backend_options, void * init_valu
   option_help h [] = {
     {0, "hdf5.collectiveMetadata", "Use collective metadata (available since HDF5-1.10.0)", OPTION_FLAG, 'd', & o->collective_md},
     {0, "hdf5.chunkSize", "Chunk size to use for I/O", OPTION_FLAG, 'd', & o->chunk_size},
+    {0, "hdf5.objectClass", "DAOS object class", OPTION_OPTIONAL_ARGUMENT, 's', & o->obj_class},
+    {0, "hdf5.whichServer", "Rank of the first server to be killed and excluded", OPTION_OPTIONAL_ARGUMENT, 'd', & o->which_server},
+    {0, "hdf5.whichServer2", "Rank of the second server to be killed and excluded", OPTION_OPTIONAL_ARGUMENT, 'd', & o->which_server2},
+    {0, "hdf5.whichRepetition", "During which repetition of the test to kill and exclude the server", OPTION_OPTIONAL_ARGUMENT, 'd', & o->which_repetition},
     LAST_OPTION
   };
   option_help * help = malloc(sizeof(h));
   memcpy(help, h, sizeof(h));
+
   return help;
 }
 
@@ -158,6 +176,8 @@ hid_t fileDataSpace;            /* file data space id */
 hid_t memDataSpace;             /* memory data space id */
 int newlyOpenedFile;            /* newly opened file */
 
+/* Handle for the dynamic Loaded Library of DAOS-VOL*/
+void *handle = NULL;
 /***************************** F U N C T I O N S ******************************/
 
 /*
@@ -183,6 +203,10 @@ static void *HDF5_Open(char *testFileName, IOR_param_t * param)
         hid_t *fd;
         MPI_Comm comm;
         MPI_Info mpiHints = MPI_INFO_NULL;
+        char *daos_vol_dir = NULL;
+        char daos_vol_lib_path[1024] = "\0";
+        herr_t (*H5daos_set_object_class)(hid_t, char *);
+        HDF5_options_t *o = (HDF5_options_t*) param->backend_options;
 
         fd = (hid_t *) malloc(sizeof(hid_t));
         if (fd == NULL)
@@ -235,6 +259,34 @@ static void *HDF5_Open(char *testFileName, IOR_param_t * param)
         accessPropList = H5Pcreate(H5P_FILE_ACCESS);
         HDF5_CHECK(accessPropList, "cannot create file access property list");
 
+        /* Get the pathname of DAOS-VOL */
+        if(NULL == (daos_vol_dir = getenv("HDF5_PLUGIN_PATH"))) {
+            ERR("getenv failed");
+            return NULL;
+        }
+
+        strcat(daos_vol_lib_path, daos_vol_dir);  
+        strcat(daos_vol_lib_path, "/libhdf5_vol_daos.so");  
+
+        /* Open the dynamically loaded library of DAOS-VOL */
+        handle = dlopen (daos_vol_lib_path, RTLD_LAZY);
+        if(!handle) {
+            ERR("dlopen failed");
+            return NULL;
+        }
+
+        /* Get the function for the property of DAOS object class */
+        if((H5daos_set_object_class = dlsym(handle, "H5daos_set_object_class")) == NULL) {
+            ERR("dlsym failed");
+            return NULL;
+        }
+
+        /* Set the property of DAOS object class to FAPL */
+        if((*H5daos_set_object_class)(accessPropList, o->obj_class) < 0) {
+            ERR("H5daos_set_object_class failed");
+            return NULL;
+        }
+
         /*
          * someday HDF5 implementation will allow subsets of MPI_COMM_WORLD
          */
@@ -268,7 +320,6 @@ static void *HDF5_Open(char *testFileName, IOR_param_t * param)
                    "cannot set alignment");
 
 #ifdef HAVE_H5PSET_ALL_COLL_METADATA_OPS
-        HDF5_options_t *o = (HDF5_options_t*) param->backend_options;
         if (o->collective_md) {
                 /* more scalable metadata */
 
@@ -463,12 +514,129 @@ static IOR_offset_t HDF5_Xfer(int access, void *fd, IOR_size_t * buffer,
                                     xferPropList, buffer),
                            "cannot write to data set");
         } else {                /* READ or CHECK */
+                KillServer(param);
                 HDF5_CHECK(H5Dread(dataSet, H5T_NATIVE_LLONG,
                                    memDataSpace, fileDataSpace,
                                    xferPropList, buffer),
                            "cannot read from data set");
         }
         return (length);
+}
+
+/*
+ * Reusable private function to kill and exclude a certain server
+ */
+static void actualKillAndExclude(int which_server, uuid_t pool_uuid, d_rank_list_t *svcl) {
+    struct d_tgt_list        targets;
+    int			     tgt = -1;
+
+    /* Kill the server */
+    if(daos_mgmt_svc_rip("daos_server", which_server, TRUE, NULL) < 0) {
+        ERR("daos_mgmt_svc_rip failed");
+        return;
+    }
+
+    targets.tl_nr = 1;
+    targets.tl_ranks = &which_server;
+    tgt = -1;
+    targets.tl_tgts = &tgt;
+
+    /* Exclude the server from the pool */
+    if(daos_pool_tgt_exclude(pool_uuid, "daos_server", svcl, &targets, NULL) < 0) {
+        ERR("daos_pool_tgt_exclude failed");
+        return;
+    }
+}
+
+/*
+ * Kill and Exclude the server
+ */
+static void KillServer(IOR_param_t * param) {
+    static unsigned int count = 0;
+    daos_handle_t poh;
+    herr_t (*H5daos_get_poh)(daos_handle_t *);
+    daos_pool_info_t	     info;
+    d_rank_list_t            *svcl;
+    struct d_tgt_list        targets;
+    char                     *pool_string = NULL;
+    uuid_t                   pool_uuid;
+    int			     tgt = -1;
+    HDF5_options_t *o = (HDF5_options_t*)param->backend_options;
+
+    /* Exit the function if no server to kill */
+    if(o->which_server < 0 && o->which_server2 < 0)
+        return;
+
+    /* If the repetition of the test matches, do the killing */
+    if(param->repCounter != o->which_repetition)
+        return;
+
+    /* Only do the killing in the first hyperslab read call */
+    if(count > 0)
+        return;
+    else
+        count++;
+
+    if(rank == 0) {
+        /* Get the POH function from the dynamically loaded library of DAOS-VOL */
+        if((H5daos_get_poh = dlsym(handle, "H5daos_get_poh")) == NULL) {
+            ERR("dlsym failed");
+            return;
+        }
+  
+        /* Get the pool object handle */ 
+        if((*H5daos_get_poh)(&poh) < 0) { 
+            ERR("H5daos_get_poh failed");
+            return;
+        }
+ 
+        /* Query the pool information */
+        if(daos_pool_query(poh, NULL, &info, NULL, NULL) < 0) {
+            ERR("daos_pool_query failed");
+            return;
+        }
+
+        /* Generate a rank list from a string with a seprator argument */
+        svcl = daos_rank_list_parse(RANK_LIST, ":");
+
+        /* Get the pool ID string */
+        if (NULL == (pool_string = getenv("DAOS_POOL"))) {
+            ERR("getenv failed");
+            return;
+        }
+
+        /* Create the pool uuid */
+        if (0 != uuid_parse(pool_string, pool_uuid)) {
+            ERR("getenv failed");
+            return;
+        }
+
+        /* Do the first killing */
+        if(o->which_server >= 0) {
+            /* Make sure the rank of the server to be killed is valid */
+            if(o->which_server > info.pi_nnodes - 1) {
+                ERR("server rank not valid");
+                return;
+            }
+       
+            actualKillAndExclude(o->which_server, pool_uuid, svcl);
+        }
+
+        /* Do the second killing */
+        if(o->which_server2 >= 0) {
+            /* Make sure the rank of the second server to be killed is valid */
+            if(o->which_server2 > info.pi_nnodes - 1) {
+                ERR("server rank not valid");
+                return;
+            }
+
+            actualKillAndExclude(o->which_server2, pool_uuid, svcl);
+        }
+
+        sleep(5);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 /*
@@ -498,6 +666,9 @@ static void HDF5_Close(void *fd, IOR_param_t * param)
         }
         HDF5_CHECK(H5Fclose(*(hid_t *) fd), "cannot close file");
         free(fd);
+
+        /* Close the handle of the dynamic loaded library of DAOS-VOL */
+        dlclose(handle);
 }
 
 /*
@@ -634,12 +805,12 @@ static void SetupDataSet(void *fd, IOR_param_t * param)
                 WARN("unable to determine HDF5 version for 'no fill' usage");
 #endif
                 dataSet =
-                    H5Dcreate(*(hid_t *) fd, dataSetName, H5T_NATIVE_LLONG,
-                              dataSpace, dataSetPropList);
+                    H5Dcreate2(*(hid_t *) fd, dataSetName, H5T_NATIVE_LLONG,
+                              dataSpace, H5P_DEFAULT, dataSetPropList, H5P_DEFAULT);
                 HDF5_CHECK(dataSet, "cannot create data set");
         } else {                /* READ or CHECK */
-                dataSet = H5Dopen(*(hid_t *) fd, dataSetName);
-                HDF5_CHECK(dataSet, "cannot create data set");
+                dataSet = H5Dopen2(*(hid_t *) fd, dataSetName, H5P_DEFAULT);
+                HDF5_CHECK(dataSet, "cannot open data set");
         }
 }
 
