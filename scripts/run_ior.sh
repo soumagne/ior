@@ -20,5 +20,9 @@ orterun -np 4 \
 -x HDF5_VOL_CONNECTOR=daos                         \
 -x DAOS_POOL=$1                                    \
 -x DAOS_SVCL=$2                                    \
-$HOME/ior/src/ior -a HDF5 -b 16m -t 1m -i 2 -w -r -E -k -W -R --hdf5.chunkSize=1048576 \
---hdf5.objectClass=RP_2G1 --hdf5.whichServer=-1 --hdf5.whichServer2=-1 --hdf5.whichRepetition=1
+$HOME/ior/src/ior -a HDF5 -b 100m -t 1m -i 1 -w -r -E -k -W -R --hdf5.chunkSize=1024 \
+--hdf5.objectClass=RP_3G1 \
+--hdf5.serverNumber=0 \
+--hdf5.whichRepetition=0 \
+--hdf5.whichIterate=85 \
+--hdf5.readOrWrite=read

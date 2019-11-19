@@ -112,7 +112,7 @@ typedef struct{
   char *obj_class;
   unsigned int numb_servers;
   int which_repetition;
-  int which_block;
+  int which_iterate;
   char *read_or_write;
 } HDF5_options_t;
 /***************************** F U N C T I O N S ******************************/
@@ -129,7 +129,7 @@ static option_help * HDF5_options(void ** init_backend_options, void * init_valu
     o->obj_class = strdup("S1");
     o->numb_servers = 0;
     o->which_repetition = 0;
-    o->which_block = 0;
+    o->which_iterate = 0;
     o->read_or_write = strdup("read");
   }
 
@@ -141,7 +141,7 @@ static option_help * HDF5_options(void ** init_backend_options, void * init_valu
     {0, "hdf5.objectClass", "DAOS object class", OPTION_OPTIONAL_ARGUMENT, 's', & o->obj_class},
     {0, "hdf5.serverNumber", "Number of the servers to be killed and excluded", OPTION_OPTIONAL_ARGUMENT, 'd', & o->numb_servers},
     {0, "hdf5.whichRepetition", "During which repetition of the test to kill and exclude the server", OPTION_OPTIONAL_ARGUMENT, 'd', & o->which_repetition},
-    {0, "hdf5.whichBlock", "During which block to kill and exclude the server", OPTION_OPTIONAL_ARGUMENT, 'd', & o->which_block},
+    {0, "hdf5.whichIterate", "During which iteration (blockSize/transferSize) to kill and exclude the server", OPTION_OPTIONAL_ARGUMENT, 'd', & o->which_iterate},
     {0, "hdf5.readOrWrite", "During data read or write to kill and exclude the server", OPTION_OPTIONAL_ARGUMENT, 's', & o->read_or_write},
     LAST_OPTION
   };
@@ -584,8 +584,8 @@ static void KillServer(IOR_param_t * param) {
     if(param->repCounter != o->which_repetition)
         return;
 
-    /* Only do the killing if the block number matches the command line input */
-    if(count != o->which_block) {
+    /* Only do the killing if the iterate number matches the command line input */
+    if(count != o->which_iterate) {
         count++;
         return;
     } else
