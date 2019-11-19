@@ -19,6 +19,7 @@
 #include <stdio.h>              /* only for fprintf() */
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <dlfcn.h>
 /* HDF5 routines here still use the old 1.6 style.  Nothing wrong with that but
  * save users the trouble of  passing this flag through configure */
@@ -109,9 +110,10 @@ typedef struct{
   int collective_md;
   int chunk_size;
   char *obj_class;
-  int which_server;
-  int which_server2;
+  unsigned int numb_servers;
   int which_repetition;
+  int which_block;
+  char *read_or_write;
 } HDF5_options_t;
 /***************************** F U N C T I O N S ******************************/
 
@@ -125,9 +127,10 @@ static option_help * HDF5_options(void ** init_backend_options, void * init_valu
     o->collective_md = 0;
     o->chunk_size = 0;
     o->obj_class = strdup("S1");
-    o->which_server = -1;
-    o->which_server2 = -1;
+    o->numb_servers = 0;
     o->which_repetition = 0;
+    o->which_block = 0;
+    o->read_or_write = strdup("read");
   }
 
   *init_backend_options = o;
@@ -136,9 +139,10 @@ static option_help * HDF5_options(void ** init_backend_options, void * init_valu
     {0, "hdf5.collectiveMetadata", "Use collective metadata (available since HDF5-1.10.0)", OPTION_FLAG, 'd', & o->collective_md},
     {0, "hdf5.chunkSize", "Chunk size to use for I/O", OPTION_FLAG, 'd', & o->chunk_size},
     {0, "hdf5.objectClass", "DAOS object class", OPTION_OPTIONAL_ARGUMENT, 's', & o->obj_class},
-    {0, "hdf5.whichServer", "Rank of the first server to be killed and excluded", OPTION_OPTIONAL_ARGUMENT, 'd', & o->which_server},
-    {0, "hdf5.whichServer2", "Rank of the second server to be killed and excluded", OPTION_OPTIONAL_ARGUMENT, 'd', & o->which_server2},
+    {0, "hdf5.serverNumber", "Number of the servers to be killed and excluded", OPTION_OPTIONAL_ARGUMENT, 'd', & o->numb_servers},
     {0, "hdf5.whichRepetition", "During which repetition of the test to kill and exclude the server", OPTION_OPTIONAL_ARGUMENT, 'd', & o->which_repetition},
+    {0, "hdf5.whichBlock", "During which block to kill and exclude the server", OPTION_OPTIONAL_ARGUMENT, 'd', & o->which_block},
+    {0, "hdf5.readOrWrite", "During data read or write to kill and exclude the server", OPTION_OPTIONAL_ARGUMENT, 's', & o->read_or_write},
     LAST_OPTION
   };
   option_help * help = malloc(sizeof(h));
@@ -178,6 +182,7 @@ int newlyOpenedFile;            /* newly opened file */
 
 /* Handle for the dynamic Loaded Library of DAOS-VOL*/
 void *handle = NULL;
+static unsigned int count = 0;
 /***************************** F U N C T I O N S ******************************/
 
 /*
@@ -450,6 +455,7 @@ static IOR_offset_t HDF5_Xfer(int access, void *fd, IOR_size_t * buffer,
 {
         static int firstReadCheck = FALSE, startNewDataSet;
         IOR_offset_t segmentPosition, segmentSize;
+        HDF5_options_t *o = (HDF5_options_t*)param->backend_options;
 
         /*
          * this toggle is for the read check operation, which passes through
@@ -509,12 +515,19 @@ static IOR_offset_t HDF5_Xfer(int access, void *fd, IOR_size_t * buffer,
 
         /* access the file */
         if (access == WRITE) {  /* WRITE */
+                if(!strcmp(o->read_or_write, "write") && rank == 0)
+                    KillServer(param);
+                MPI_Barrier(MPI_COMM_WORLD);
+
                 HDF5_CHECK(H5Dwrite(dataSet, H5T_NATIVE_LLONG,
                                     memDataSpace, fileDataSpace,
                                     xferPropList, buffer),
                            "cannot write to data set");
         } else {                /* READ or CHECK */
-                KillServer(param);
+                if(!strcmp(o->read_or_write, "read") && rank == 0)
+                    KillServer(param);
+                MPI_Barrier(MPI_COMM_WORLD);
+
                 HDF5_CHECK(H5Dread(dataSet, H5T_NATIVE_LLONG,
                                    memDataSpace, fileDataSpace,
                                    xferPropList, buffer),
@@ -552,7 +565,6 @@ static void actualKillAndExclude(int which_server, uuid_t pool_uuid, d_rank_list
  * Kill and Exclude the server
  */
 static void KillServer(IOR_param_t * param) {
-    static unsigned int count = 0;
     daos_handle_t poh;
     herr_t (*H5daos_get_poh)(daos_handle_t *);
     daos_pool_info_t	     info;
@@ -562,81 +574,59 @@ static void KillServer(IOR_param_t * param) {
     uuid_t                   pool_uuid;
     int			     tgt = -1;
     HDF5_options_t *o = (HDF5_options_t*)param->backend_options;
+    int                      i;
 
     /* Exit the function if no server to kill */
-    if(o->which_server < 0 && o->which_server2 < 0)
+    if(o->numb_servers == 0)
         return;
 
     /* If the repetition of the test matches, do the killing */
     if(param->repCounter != o->which_repetition)
         return;
 
-    /* Only do the killing in the first hyperslab read call */
-    if(count > 0)
+    /* Only do the killing if the block number matches the command line input */
+    if(count != o->which_block) {
+        count++;
         return;
-    else
+    } else
         count++;
 
-    if(rank == 0) {
-        /* Get the POH function from the dynamically loaded library of DAOS-VOL */
-        if((H5daos_get_poh = dlsym(handle, "H5daos_get_poh")) == NULL) {
-            ERR("dlsym failed");
-            return;
-        }
+    /* Get the POH function from the dynamically loaded library of DAOS-VOL */
+    if((H5daos_get_poh = dlsym(handle, "H5daos_get_poh")) == NULL) {
+        ERR("dlsym failed");
+        return;
+    }
   
-        /* Get the pool object handle */ 
-        if((*H5daos_get_poh)(&poh) < 0) { 
-            ERR("H5daos_get_poh failed");
-            return;
-        }
- 
-        /* Query the pool information */
-        if(daos_pool_query(poh, NULL, &info, NULL, NULL) < 0) {
-            ERR("daos_pool_query failed");
-            return;
-        }
-
-        /* Generate a rank list from a string with a seprator argument */
-        svcl = daos_rank_list_parse(RANK_LIST, ":");
-
-        /* Get the pool ID string */
-        if (NULL == (pool_string = getenv("DAOS_POOL"))) {
-            ERR("getenv failed");
-            return;
-        }
-
-        /* Create the pool uuid */
-        if (0 != uuid_parse(pool_string, pool_uuid)) {
-            ERR("getenv failed");
-            return;
-        }
-
-        /* Do the first killing */
-        if(o->which_server >= 0) {
-            /* Make sure the rank of the server to be killed is valid */
-            if(o->which_server > info.pi_nnodes - 1) {
-                ERR("server rank not valid");
-                return;
-            }
-       
-            actualKillAndExclude(o->which_server, pool_uuid, svcl);
-        }
-
-        /* Do the second killing */
-        if(o->which_server2 >= 0) {
-            /* Make sure the rank of the second server to be killed is valid */
-            if(o->which_server2 > info.pi_nnodes - 1) {
-                ERR("server rank not valid");
-                return;
-            }
-
-            actualKillAndExclude(o->which_server2, pool_uuid, svcl);
-        }
-
-        sleep(5);
+    /* Get the pool object handle */ 
+    if((*H5daos_get_poh)(&poh) < 0) { 
+        ERR("H5daos_get_poh failed");
+        return;
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    /* Query the pool information */
+    if(daos_pool_query(poh, NULL, &info, NULL, NULL) < 0) {
+        ERR("daos_pool_query failed");
+        return;
+    }
+
+    /* Generate a rank list from a string with a seprator argument */
+    svcl = daos_rank_list_parse(RANK_LIST, ":");
+
+    /* Get the pool ID string */
+    if (NULL == (pool_string = getenv("DAOS_POOL"))) {
+        ERR("getenv failed");
+        return;
+    }
+
+    /* Create the pool uuid */
+    if (0 != uuid_parse(pool_string, pool_uuid)) {
+        ERR("getenv failed");
+        return;
+    }
+
+    /* Kill the servers listed */
+    for(i = 0; i < o->numb_servers; i++)
+        actualKillAndExclude(info.pi_nnodes - 1 - i, pool_uuid, svcl);
 }
 
 /*
