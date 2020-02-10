@@ -33,7 +33,6 @@
 #include "iordef.h"
 
 #define NUM_DIMS 1              /* number of dimensions to data set */
-#define RANK_LIST "1:2:3:4:5:6:7:8:9:10:11:12:13:14:15:16" /* Rank list for excluding a server */
 
 /******************************************************************************/
 /*
@@ -132,7 +131,7 @@ static option_help * HDF5_options(void ** init_backend_options, void * init_valu
     /* initialize the options properly */
     o->collective_md = 0;
     o->chunk_size = 0;
-    o->daos_obj_class = strdup("S1");
+    o->daos_obj_class = NULL;
     o->numb_faults = 0;
     o->server_ranks_str = NULL;
     o->fault_iterates_str = NULL;
@@ -558,6 +557,10 @@ static int set_options(IOR_param_t *param)
         daos_pool_info_t         info;
         int i, j;
 
+        /* The default of DAOS object class */
+        if(NULL == o->daos_obj_class)
+            o->daos_obj_class = strdup("S1");
+
         /* Figure out the set of the server ranks for fault injection */
         if(o->numb_faults) {
             char *ranks_str_copy = NULL;
@@ -711,14 +714,21 @@ static void InjectFault(IOR_param_t * param) {
     d_rank_list_t            *svcl;
     struct d_tgt_list        targets;
     char                     *pool_string = NULL;
+    char                     *svcl_string = NULL;
     uuid_t                   pool_uuid;
     int			     tgt = -1;
     HDF5_options_t *o = (HDF5_options_t*)param->backend_options;
     char                     *rank1_str=NULL, *rank2_str=NULL;
     int                      i;
 
+    /* Get the pool ID string */
+    if (NULL == (svcl_string = getenv("DAOS_SVCL"))) {
+        ERR("getenv failed");
+        return;
+    }
+
     /* Generate a rank list from a string with a seprator argument */
-    svcl = daos_rank_list_parse(RANK_LIST, ":");
+    svcl = daos_rank_list_parse(svcl_string, ":");
 
     /* Get the pool ID string */
     if (NULL == (pool_string = getenv("DAOS_POOL"))) {
@@ -930,9 +940,9 @@ static void SetupDataSet(void *fd, IOR_param_t * param)
 #else
                 WARN("unable to determine HDF5 version for 'no fill' usage");
 #endif
-                dataSet =
-                    H5Dcreate2(*(hid_t *) fd, dataSetName, H5T_NATIVE_LLONG,
-                              dataSpace, H5P_DEFAULT, dataSetPropList, H5P_DEFAULT);
+                  dataSet =
+                    H5Dcreate(*(hid_t *) fd, dataSetName, H5T_NATIVE_LLONG,
+                              dataSpace, dataSetPropList);
                 HDF5_CHECK(dataSet, "cannot create data set");
         } else {                /* READ or CHECK */
                 dataSet = H5Dopen2(*(hid_t *) fd, dataSetName, H5P_DEFAULT);

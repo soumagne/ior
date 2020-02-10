@@ -1308,9 +1308,9 @@ static void TestIoSys(IOR_test_t *test)
                            testComm), "cannot broadcast start time value");
 
                 FillBuffer(ioBuffers.buffer, params, 0, pretendRank);
-                /* use repetition count for number of multiple files */
-                //if (params->multiFile)
-                        params->repCounter = rep;
+
+                /* keep track of repetition count */
+                params->repCounter = rep;
 
                 /*
                  * write the file(s), getting timing between I/O calls
