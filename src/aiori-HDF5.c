@@ -23,7 +23,7 @@
 #include <dlfcn.h>
 /* HDF5 routines here still use the old 1.6 style.  Nothing wrong with that but
  * save users the trouble of  passing this flag through configure */
-//#define H5_USE_16_API
+#define H5_USE_16_API
 #include <hdf5.h>
 #include <mpi.h>
 #include <daos.h>
@@ -945,7 +945,7 @@ static void SetupDataSet(void *fd, IOR_param_t * param)
                               dataSpace, dataSetPropList);
                 HDF5_CHECK(dataSet, "cannot create data set");
         } else {                /* READ or CHECK */
-                dataSet = H5Dopen2(*(hid_t *) fd, dataSetName, H5P_DEFAULT);
+                dataSet = H5Dopen(*(hid_t *) fd, dataSetName);
                 HDF5_CHECK(dataSet, "cannot open data set");
         }
 }

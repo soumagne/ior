@@ -4,7 +4,7 @@ AGENT_DIR=$TMP_DIR
 URI_PATH=$HOME
 HDF5_DAOS_VOL_BUILD_PATH=$HOME/daos-vol_new/build
 
-orterun -np 8 \
+mpirun -np 8 \
 -x D_LOG_FILE=$TMP_DIR/daos_client.log             \
 -x D_LOG_MASK=ERR                                  \
 -x CRT_PHY_ADDR_STR=ofi+sockets                    \
