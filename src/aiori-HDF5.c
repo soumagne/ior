@@ -19,11 +19,14 @@
 #include <stdio.h>              /* only for fprintf() */
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <dlfcn.h>
 /* HDF5 routines here still use the old 1.6 style.  Nothing wrong with that but
  * save users the trouble of  passing this flag through configure */
 #define H5_USE_16_API
 #include <hdf5.h>
 #include <mpi.h>
+#include <daos.h>
 
 #include "aiori.h"              /* abstract IOR interface */
 #include "utilities.h"
@@ -99,11 +102,23 @@ static int HDF5_RmDir(const char *, IOR_param_t *);
 static int HDF5_Access(const char *, int, IOR_param_t *);
 static int HDF5_Stat(const char *, struct stat *, IOR_param_t *);
 
+static int set_options(IOR_param_t *);
+static void InjectFault(IOR_param_t *);
+
 /************************** O P T I O N S *****************************/
 typedef struct{
   int collective_md;
   int chunk_size;
+  char *daos_obj_class;
+  unsigned int numb_faults;
+  char *server_ranks_str;
+  char *fault_iterates_str;
+  char *fault_rw_str;
 } HDF5_options_t;
+
+int *daos_server_ranks = NULL;
+int *fault_iterates = NULL;
+int *fault_rw = NULL;
 /***************************** F U N C T I O N S ******************************/
 
 static option_help * HDF5_options(void ** init_backend_options, void * init_values){
@@ -115,6 +130,11 @@ static option_help * HDF5_options(void ** init_backend_options, void * init_valu
     /* initialize the options properly */
     o->collective_md = 0;
     o->chunk_size = 0;
+    o->daos_obj_class = NULL;
+    o->numb_faults = 0;
+    o->server_ranks_str = NULL;
+    o->fault_iterates_str = NULL;
+    o->fault_rw_str = NULL;
   }
 
   *init_backend_options = o;
@@ -122,6 +142,11 @@ static option_help * HDF5_options(void ** init_backend_options, void * init_valu
   option_help h [] = {
     {0, "hdf5.collectiveMetadata", "Use collective metadata (available since HDF5-1.10.0)", OPTION_FLAG, 'd', & o->collective_md},
     {0, "hdf5.chunkSize", "Chunk size to use for I/O", OPTION_FLAG, 'd', & o->chunk_size},
+    {0, "hdf5.daosObjClass", "DAOS object class", OPTION_OPTIONAL_ARGUMENT, 's', & o->daos_obj_class},
+    {0, "hdf5.nFaultInjects", "Number of the servers to be killed and excluded as the fault injection", OPTION_OPTIONAL_ARGUMENT, 'd', & o->numb_faults},
+    {0, "hdf5.daosServerRanks", "List of the server ranks to be killed and excluded as the fault injection", OPTION_OPTIONAL_ARGUMENT, 's', & o->server_ranks_str},
+    {0, "hdf5.faultIterates", "List of the test iterations to kill and exclude the server as the fault injection", OPTION_OPTIONAL_ARGUMENT, 's', & o->fault_iterates_str},
+    {0, "hdf5.faultRW", "During data read or write to kill and exclude the server as the fault injection", OPTION_OPTIONAL_ARGUMENT, 's', & o->fault_rw_str},
     LAST_OPTION
   };
   option_help * help = malloc(sizeof(h));
@@ -158,6 +183,9 @@ hid_t fileDataSpace;            /* file data space id */
 hid_t memDataSpace;             /* memory data space id */
 int newlyOpenedFile;            /* newly opened file */
 
+/* Handle for the dynamic Loaded Library of DAOS-VOL*/
+void *dl_handle = NULL;
+static unsigned int server_count = 0;
 /***************************** F U N C T I O N S ******************************/
 
 /*
@@ -183,6 +211,34 @@ static void *HDF5_Open(char *testFileName, IOR_param_t * param)
         hid_t *fd;
         MPI_Comm comm;
         MPI_Info mpiHints = MPI_INFO_NULL;
+        char *daos_vol_dir = NULL;
+        char daos_vol_lib_path[1024] = "\0";
+        herr_t (*H5daos_set_object_class)(hid_t, char *);
+        HDF5_options_t *o;
+
+        /* Get the pathname of DAOS-VOL */
+        if(NULL == (daos_vol_dir = getenv("HDF5_PLUGIN_PATH"))) {
+            ERR("getenv failed");
+            return NULL;
+        }
+
+        strcat(daos_vol_lib_path, daos_vol_dir);
+        strcat(daos_vol_lib_path, "/libhdf5_vol_daos.so");
+
+        /* Open the dynamically loaded library of DAOS-VOL */
+        dl_handle = dlopen (daos_vol_lib_path, RTLD_LAZY);
+        if(!dl_handle) {
+            ERR("dlopen failed");
+            return NULL;
+        }
+
+        /* Figure out the lists of the conditions for the fault injection */
+        if(set_options(param) < 0) {
+            ERR("setting command-line options failed");
+            return NULL;
+        }
+
+        o = (HDF5_options_t*) param->backend_options;
 
         fd = (hid_t *) malloc(sizeof(hid_t));
         if (fd == NULL)
@@ -235,6 +291,18 @@ static void *HDF5_Open(char *testFileName, IOR_param_t * param)
         accessPropList = H5Pcreate(H5P_FILE_ACCESS);
         HDF5_CHECK(accessPropList, "cannot create file access property list");
 
+        /* Get the function for the property of DAOS object class */
+        if((H5daos_set_object_class = dlsym(dl_handle, "H5daos_set_object_class")) == NULL) {
+            ERR("dlsym failed");
+            return NULL;
+        }
+
+        /* Set the property of DAOS object class to FAPL */
+        if((*H5daos_set_object_class)(accessPropList, o->daos_obj_class) < 0) {
+            ERR("H5daos_set_object_class failed");
+            return NULL;
+        }
+
         /*
          * someday HDF5 implementation will allow subsets of MPI_COMM_WORLD
          */
@@ -268,7 +336,6 @@ static void *HDF5_Open(char *testFileName, IOR_param_t * param)
                    "cannot set alignment");
 
 #ifdef HAVE_H5PSET_ALL_COLL_METADATA_OPS
-        HDF5_options_t *o = (HDF5_options_t*) param->backend_options;
         if (o->collective_md) {
                 /* more scalable metadata */
 
@@ -399,6 +466,8 @@ static IOR_offset_t HDF5_Xfer(int access, void *fd, IOR_size_t * buffer,
 {
         static int firstReadCheck = FALSE, startNewDataSet;
         IOR_offset_t segmentPosition, segmentSize;
+        HDF5_options_t *o = (HDF5_options_t*)param->backend_options;
+        char *rank1_str=NULL, *rank2_str=NULL;
 
         /*
          * this toggle is for the read check operation, which passes through
@@ -456,6 +525,14 @@ static IOR_offset_t HDF5_Xfer(int access, void *fd, IOR_size_t * buffer,
         startNewDataSet = FALSE;
         newlyOpenedFile = FALSE;
 
+        /* Inject fault if the conditions match */
+        if(rank == 0 && o->numb_faults && param->repCounter == fault_iterates[server_count]) {
+            if((access == WRITE && fault_rw[server_count] == WRITE) ||
+              ((access == READ || access == READCHECK) && fault_rw[server_count] == READ)) {
+                InjectFault(param);
+           }
+        }
+
         /* access the file */
         if (access == WRITE) {  /* WRITE */
                 HDF5_CHECK(H5Dwrite(dataSet, H5T_NATIVE_LLONG,
@@ -469,6 +546,206 @@ static IOR_offset_t HDF5_Xfer(int access, void *fd, IOR_size_t * buffer,
                            "cannot read from data set");
         }
         return (length);
+}
+
+static int set_options(IOR_param_t *param)
+{
+        HDF5_options_t *o = (HDF5_options_t*)param->backend_options;
+        daos_handle_t poh;
+        herr_t (*H5daos_get_poh)(daos_handle_t *);
+        daos_pool_info_t         info;
+        int i, j;
+
+        /* The default of DAOS object class */
+        if(NULL == o->daos_obj_class)
+            o->daos_obj_class = strdup("S1");
+
+        /* Figure out the set of the server ranks for fault injection */
+        if(o->numb_faults) {
+            char *ranks_str_copy = NULL;
+
+            if(o->server_ranks_str)
+                ranks_str_copy = strdup(o->server_ranks_str);
+
+            daos_server_ranks = malloc(o->numb_faults * sizeof(int));
+
+            if(ranks_str_copy) {
+                char *rank_str = strtok(ranks_str_copy, ",");
+
+                daos_server_ranks[0] = atoi(rank_str);
+
+                i = 1;
+                while(rank_str) {
+                    rank_str = strtok(NULL, ",");
+                    if(rank_str && i < o->numb_faults)
+                        daos_server_ranks[i] = atoi(rank_str);
+                    i++;
+                }
+
+                free(ranks_str_copy);
+            } else { /* If no option is passed in, use the default: the list starts from the highest server rank and descend according the number of fault injections */
+                /* Get the POH function from the dynamically loaded library of DAOS-VOL */
+                if((H5daos_get_poh = dlsym(dl_handle, "H5daos_get_poh")) == NULL) {
+                    ERR("dlsym failed");
+                    return 1;
+                }
+
+                /* Get the pool object handle */
+                if((*H5daos_get_poh)(&poh) < 0) {
+                    ERR("H5daos_get_poh failed");
+                    return 1;
+                }
+
+                /* Query the pool information */
+                if(daos_pool_query(poh, NULL, &info, NULL, NULL) < 0) {
+                    ERR("daos_pool_query failed");
+                    return 1;
+                }
+
+                for(i = 0; i < o->numb_faults; i++)
+                    daos_server_ranks[i] = info.pi_nnodes - 1 - i;
+            }
+         }
+
+         /* Figure out the list of iterations for fault injection */
+         if(o->numb_faults) {
+            char *fault_iterates_str_copy = NULL;
+
+            if(o->fault_iterates_str)
+                fault_iterates_str_copy = strdup(o->fault_iterates_str);
+
+            fault_iterates = (int *)malloc(o->numb_faults * sizeof(int));
+
+            /* Default value is the first iteration */
+            for(i = 0; i < o->numb_faults; i++)
+                fault_iterates[i] = 0;
+
+            if(fault_iterates_str_copy) {
+                char *iterate_str = strtok(fault_iterates_str_copy, ",");
+
+                if(iterate_str)
+                    fault_iterates[0] = atoi(iterate_str);
+
+                i = 1;
+                while(iterate_str) {
+                    iterate_str = strtok(NULL, ",");
+                    if(iterate_str && i < o->numb_faults)
+                        fault_iterates[i] = atoi(iterate_str);
+                    i++;
+                }
+
+                free(fault_iterates_str_copy);
+            }
+         }
+
+         /* Figure out the list of read or write for fault injection */
+         if(o->numb_faults) {
+             char *fault_rw_str_copy = NULL;
+
+             if(o->fault_rw_str)
+                 fault_rw_str_copy = strdup(o->fault_rw_str);
+
+             fault_rw = (int *)malloc(o->numb_faults * sizeof(int));
+
+            /* Default value is read */
+             for(i = 0; i < o->numb_faults; i++)
+                fault_rw[i] = READ;
+
+             if(fault_rw_str_copy) {
+                char *rw_str = strtok(fault_rw_str_copy, ",");
+                if(!strcmp(rw_str, "read"))
+                    fault_rw[0] = READ;
+                else if(!strcmp(rw_str, "write"))
+                    fault_rw[0] = WRITE;
+                else
+                    fault_rw[0] = READ;
+
+                i = 1;
+                while(rw_str) {
+                    rw_str = strtok(NULL, ",");
+                    if(rw_str && i < o->numb_faults) {
+                        if(!strcmp(rw_str, "read"))
+                            fault_rw[i] = READ;
+                        else if(!strcmp(rw_str, "write"))
+                            fault_rw[i] = WRITE;
+                        else
+                            fault_rw[i] = READ;
+                    }
+                    i++;
+                }
+
+                free(fault_rw_str_copy);
+             }
+         }
+
+         return 0;
+}
+
+/*
+ * Reusable private function to kill and exclude a certain server
+ */
+static void actualKillAndExclude(int which_server, uuid_t pool_uuid, d_rank_list_t *svcl) {
+    struct d_tgt_list        targets;
+    int			     tgt = -1;
+
+    /* Kill the server */
+    if(daos_mgmt_svc_rip("daos_server", which_server, TRUE, NULL) < 0) {
+        ERR("daos_mgmt_svc_rip failed");
+        return;
+    }
+
+    targets.tl_nr = 1;
+    targets.tl_ranks = &which_server;
+    tgt = -1;
+    targets.tl_tgts = &tgt;
+
+    /* Exclude the server from the pool */
+    if(daos_pool_tgt_exclude(pool_uuid, "daos_server", svcl, &targets, NULL) < 0) {
+        ERR("daos_pool_tgt_exclude failed");
+        return;
+    }
+}
+
+/*
+ * Kill and Exclude the server
+ */
+static void InjectFault(IOR_param_t * param) {
+    d_rank_list_t            *svcl;
+    struct d_tgt_list        targets;
+    char                     *pool_string = NULL;
+    char                     *svcl_string = NULL;
+    uuid_t                   pool_uuid;
+    int			     tgt = -1;
+    HDF5_options_t *o = (HDF5_options_t*)param->backend_options;
+    char                     *rank1_str=NULL, *rank2_str=NULL;
+    int                      i;
+
+    /* Get the pool ID string */
+    if (NULL == (svcl_string = getenv("DAOS_SVCL"))) {
+        ERR("getenv failed");
+        return;
+    }
+
+    /* Generate a rank list from a string with a seprator argument */
+    svcl = daos_rank_list_parse(svcl_string, ":");
+
+    /* Get the pool ID string */
+    if (NULL == (pool_string = getenv("DAOS_POOL"))) {
+        ERR("getenv failed");
+        return;
+    }
+
+    /* Create the pool uuid */
+    if (0 != uuid_parse(pool_string, pool_uuid)) {
+        ERR("getenv failed");
+        return;
+    }
+
+    /* Kill the servers listed */
+    if(daos_server_ranks[server_count] >= 0) {
+        actualKillAndExclude(daos_server_ranks[server_count], pool_uuid, svcl);
+        server_count++;
+    }
 }
 
 /*
@@ -498,6 +775,25 @@ static void HDF5_Close(void *fd, IOR_param_t * param)
         }
         HDF5_CHECK(H5Fclose(*(hid_t *) fd), "cannot close file");
         free(fd);
+
+        /* Close the handle of the dynamic loaded library of DAOS-VOL */
+        dlclose(dl_handle);
+
+        /* Free some buffers deriving from command-line options */
+        if(daos_server_ranks) {
+            free(daos_server_ranks);
+            daos_server_ranks = NULL;
+        }
+
+        if(fault_iterates) {
+            free(fault_iterates);
+            fault_iterates = NULL;
+        }
+
+        if(fault_rw) {
+            free(fault_rw);
+            fault_rw = NULL;
+        }
 }
 
 /*
