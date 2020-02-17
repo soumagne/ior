@@ -775,7 +775,7 @@ void GetTestFileName(char *testFileName, IOR_param_t * test)
         }
 
         /* add suffix for multiple files */
-        if (test->repCounter > -1) {
+        if (test->repCounter > -1 && test->multiFile) {
                 sprintf(tmpString, ".%d", test->repCounter);
                 strcat(testFileName, tmpString);
         }
@@ -1306,9 +1306,9 @@ static void TestIoSys(IOR_test_t *test)
                            testComm), "cannot broadcast start time value");
 
                 FillBuffer(ioBuffers.buffer, params, 0, pretendRank);
-                /* use repetition count for number of multiple files */
-                if (params->multiFile)
-                        params->repCounter = rep;
+
+                /* keep track of repetition count */
+                params->repCounter = rep;
 
                 /*
                  * write the file(s), getting timing between I/O calls
