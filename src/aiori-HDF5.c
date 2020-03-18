@@ -505,10 +505,26 @@ static void HDF5_Close(void *fd, IOR_param_t * param)
  */
 static void HDF5_Delete(char *testFileName, IOR_param_t * param)
 {
-        if(param->dryRun)
-          return;
+        hid_t vol_id, accessPropList;
 
-        HDF5_CHECK(H5Fdelete(testFileName, H5P_DEFAULT), "cannot delete file");
+        if(param->dryRun)
+                return;
+
+        /* set up file access property list */
+        accessPropList = H5Pcreate(H5P_FILE_ACCESS);
+        HDF5_CHECK(accessPropList, "cannot create file access property list");
+        HDF5_CHECK(H5Pget_vol_id(accessPropList, &vol_id),
+                   "cannot get vol id");
+
+        if (vol_id == H5VL_NATIVE)
+            MPIIO_Delete(testFileName, param);
+        else
+            HDF5_CHECK(H5Fdelete(testFileName, accessPropList), "cannot delete file");
+
+        HDF5_CHECK(H5Pclose(accessPropList),
+                   "cannot close access property list");
+        HDF5_CHECK(H5VLclose(vol_id), "cannot close VOL ID");
+
         return;
 }
 
@@ -648,9 +664,29 @@ static void SetupDataSet(void *fd, IOR_param_t * param)
 static IOR_offset_t
 HDF5_GetFileSize(IOR_param_t * test, MPI_Comm testComm, char *testFileName)
 {
-        if(rank == 0)        
-                WARN("getfilesize not supported in HDF5 backend!");
-        return -1;
+        hid_t vol_id, accessPropList;
+        IOR_offset_t ret;
+
+        /* set up file access property list */
+        accessPropList = H5Pcreate(H5P_FILE_ACCESS);
+        HDF5_CHECK(accessPropList, "cannot create file access property list");
+        HDF5_CHECK(H5Pget_vol_id(accessPropList, &vol_id),
+            "cannot get vol id");
+        HDF5_CHECK(H5Pclose(accessPropList),
+            "cannot close access property list");
+
+        if (vol_id == H5VL_NATIVE)
+            ret = MPIIO_GetFileSize(test, testComm, testFileName);
+        else {
+            if(rank == 0)
+                WARN("getfilesize not supported with current VOL connector!");
+
+            ret = -1;
+        }
+
+        HDF5_CHECK(H5VLclose(vol_id), "cannot close VOL ID");
+
+        return ret;
 }
 
 static int HDF5_StatFS(const char *oid, ior_aiori_statfs_t *stat_buf,
@@ -679,8 +715,9 @@ static int HDF5_Access(const char *path, int mode, IOR_param_t *param)
 {
         htri_t accessible = -1;
         hid_t accessPropList;
-        MPI_Comm comm;
+        MPI_Comm comm = MPI_COMM_SELF; /* Ony one rank accesses the file */
         MPI_Info mpiHints = MPI_INFO_NULL;
+        int ret = -1;
 
         if(param->dryRun)
                 return 0;
@@ -689,18 +726,19 @@ static int HDF5_Access(const char *path, int mode, IOR_param_t *param)
         accessPropList = H5Pcreate(H5P_FILE_ACCESS);
         HDF5_CHECK(accessPropList, "cannot create file access property list");
 
-       /* store MPI communicator info for the file access property list */
-        if (param->filePerProc) {
-                comm = MPI_COMM_SELF;
-        } else {
-                comm = testComm;
-        }
+        HDF5_CHECK(H5Pset_fapl_mpio(accessPropList, comm, mpiHints),
+                   "cannot set file access property list");
 
-        accessible = H5Fis_accessible(path, accessPropList);
+        H5E_BEGIN_TRY {
+            accessible = H5Fis_accessible(path, accessPropList);
+        } H5E_END_TRY;
+        if (accessible > 0)
+            ret = 0;
+
         HDF5_CHECK(H5Pclose(accessPropList),
                    "cannot close access property list");
 
-        return !accessible;
+        return ret;
 }
 
 static int HDF5_Stat(const char *oid, struct stat *buf, IOR_param_t *param)
