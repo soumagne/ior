@@ -581,9 +581,7 @@ static IOR_offset_t SeekOffset(void *fd, IOR_offset_t offset,
         hsStride[0] = (hsize_t) (param->transferSize / sizeof(IOR_size_t));
         hsBlock[0] = (hsize_t) (param->transferSize / sizeof(IOR_size_t));
 
-        /* retrieve data space from data set for hyperslab */
-        fileDataSpace = H5Dget_space(dataSet);
-        HDF5_CHECK(fileDataSpace, "cannot get data space from data set");
+        /* select hyperslab in file data space */
         HDF5_CHECK(H5Sselect_hyperslab(fileDataSpace, H5S_SELECT_SET,
                                        hsStart, hsStride, hsCount, hsBlock),
                    "cannot select hyperslab");
@@ -659,6 +657,10 @@ static void SetupDataSet(void *fd, IOR_param_t * param)
                 dataSet = H5Dopen(*(hid_t *) fd, dataSetName);
                 HDF5_CHECK(dataSet, "cannot open data set");
         }
+
+        /* retrieve data space from data set for hyperslab */
+        fileDataSpace = H5Dget_space(dataSet);
+        HDF5_CHECK(fileDataSpace, "cannot get data space from data set");
 }
 
 static IOR_offset_t
