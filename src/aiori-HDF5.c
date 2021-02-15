@@ -182,7 +182,6 @@ static HDF5_xfer_ops_t xferOps = {
 
 static hid_t xferPropList;      /* xfer property list */
 static hid_t dataSet;           /* data set id */
-static hid_t dataSpace;         /* data space id */
 static hid_t fileDataSpace;     /* file data space id */
 static hid_t memDataSpace;      /* memory data space id */
 #ifdef HAVE_H5DWRITE_ASYNC
@@ -460,8 +459,8 @@ static aiori_fd_t *HDF5_Open(char *testFileName, int flags, aiori_mod_opt_t * pa
 
         /* create a simple data space containing information on size
            and shape of data set, and open it for access */
-        dataSpace = H5Screate_simple(NUM_DIMS, dataSetDims, NULL);
-        HDF5_CHECK(dataSpace, "cannot create simple data space");
+        fileDataSpace = H5Screate_simple(NUM_DIMS, dataSetDims, NULL);
+        HDF5_CHECK(fileDataSpace, "cannot create simple data space");
         if (mpiHints != MPI_INFO_NULL)
                 MPI_Info_free(&mpiHints);
 
@@ -520,8 +519,7 @@ static IOR_offset_t HDF5_Xfer(int access, aiori_fd_t *fd, IOR_size_t * buffer,
                 /* if just opened this file, no data set to close yet */
                 if (newlyOpenedFile != TRUE) {
                         HDF5_CHECK(H5Dclose(dataSet), "cannot close data set");
-                        HDF5_CHECK(H5Sclose(fileDataSpace),
-                                   "cannot close file data space");
+                        dataSet = H5I_INVALID_HID;
                 }
                 SetupDataSet(fd, access == WRITE ? IOR_CREAT : IOR_RDWR, param);
         }
@@ -616,18 +614,23 @@ static void HDF5_Close(aiori_fd_t *fd, aiori_mod_opt_t * param)
 
         //if (hints->fd_fppReadCheck == NULL) {
                 HDF5_CHECK(H5Dclose(dataSet), "cannot close data set");
-                HDF5_CHECK(H5Sclose(dataSpace), "cannot close data space");
+                dataSet = H5I_INVALID_HID;
                 HDF5_CHECK(H5Sclose(fileDataSpace),
                            "cannot close file data space");
+                fileDataSpace = H5I_INVALID_HID;
                 HDF5_CHECK(H5Sclose(memDataSpace),
                            "cannot close memory data space");
+                memDataSpace = H5I_INVALID_HID;
                 HDF5_CHECK(H5Pclose(xferPropList),
                            " cannot close transfer property list");
+                xferPropList = H5I_INVALID_HID;
         //}
         HDF5_CHECK(H5Fclose(*(hid_t *) fd), "cannot close file");
+        *(hid_t *) fd = H5I_INVALID_HID;
 #ifdef HAVE_H5DWRITE_ASYNC
         if (o->async_data) {
                 HDF5_CHECK(H5ESclose(eventStack), "cannot close event stack");
+                eventStack = H5I_INVALID_HID;
         }
 #endif
 
@@ -798,16 +801,15 @@ static void SetupDataSet(void *fd, int flags, aiori_mod_opt_t * param)
 #endif
                 dataSet =
                     H5Dcreate(*(hid_t *) fd, dataSetName, H5T_NATIVE_LLONG,
-                              dataSpace, dataSetPropList);
+                              fileDataSpace, dataSetPropList);
                 HDF5_CHECK(dataSet, "cannot create data set");
         } else {                /* READ or CHECK */
                 dataSet = H5Dopen(*(hid_t *) fd, dataSetName);
                 HDF5_CHECK(dataSet, "cannot open data set");
         }
 
-        /* retrieve data space from data set for hyperslab */
-        fileDataSpace = H5Dget_space(dataSet);
-        HDF5_CHECK(fileDataSpace, "cannot get data space from data set");
+        /* Reset dataspace selection */
+        HDF5_CHECK(H5Sselect_none(fileDataSpace), "cannot reset dataspace selection");
 }
 
 static IOR_offset_t HDF5_GetFileSize(aiori_mod_opt_t * test, char *testFileName)
