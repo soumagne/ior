@@ -174,6 +174,8 @@ AM_COND_IF([USE_HDF5_AIORI],[
         AC_DEFINE([USE_HDF5_AIORI], [], [Build HDF5 backend AIORI])
 	AC_SEARCH_LIBS([H5Pset_all_coll_metadata_ops], [hdf5])
 	AC_CHECK_FUNCS([H5Pset_all_coll_metadata_ops])
+	AC_CHECK_FUNCS([H5Pget_vol_id])
+	AC_CHECK_FUNCS([H5Fdelete])
 ])
 
 
