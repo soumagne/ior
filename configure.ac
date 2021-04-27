@@ -176,6 +176,7 @@ AM_COND_IF([USE_HDF5_AIORI],[
 	AC_CHECK_FUNCS([H5Pset_all_coll_metadata_ops])
 	AC_CHECK_FUNCS([H5Pget_vol_id])
 	AC_CHECK_FUNCS([H5Fdelete])
+	AC_CHECK_FUNCS([H5Dwrite_async])
 ])
 
 
